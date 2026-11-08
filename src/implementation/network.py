@@ -13,6 +13,7 @@ the downstream task for the two is the same, use the network to predict a single
 we use the same network and same parameters to predict both the action value (actor) and how well we did (critic) 
 '''
 
+
 class FeedForwardNetwork(nn.Module):
   def __init__(self, input_size, hidden_size, output_size):
     super().__init__()
@@ -24,7 +25,8 @@ class FeedForwardNetwork(nn.Module):
   def forward(self, x):
     #x is the observation space (our inputs)
     if not isinstance(x, torch.Tensor):
-      x = torch.tensor(x, dtype=torch.float32)
+      x = torch.tensor(x, dtype=torch.float32, device=self.layer1.weight.device)
+      
     x = self.layer1(x)
     x = F.tanh(x) #tanh preferable to relu in PPO optimization (can experiment with Relu/LeakyReLu)
     x = self.layer2(x)

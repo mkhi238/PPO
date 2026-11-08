@@ -1,13 +1,15 @@
 import numpy as np
 import torch
 import torch.optim as opt
+import torch.nn.functional as F
+import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
-from torch.distributions import Categorical, Normal, MultivariateNormal, Bernoulli, Beta
+from torch.distributions import Categorical, Normal, Independent, Bernoulli, Beta
 from tensordict.nn import TensorDictModule
 from tensordict import TensorDict
 from torchrl.objectives.value import GAE
 
-from network import FeedForwardNetwork
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 class PPO:
   '''
@@ -18,9 +20,13 @@ class PPO:
   def train: train our PPO model using our rollouts, objective, and loss
   
   PPO(env, FeedForwardNetwork, FeedForwardNetwork, **hypers)
-  
   '''
+  
   def __init__(self, env, actor_network, critic_network, **hyperparameters):
+    '''
+    Initalize the PPO 
+    '''
+    
     #get env
     self.env = env
     self.action_space = env.action_space #returns int dim
@@ -28,12 +34,11 @@ class PPO:
     
     #hyperparams init
     self._init_hyperparameters(**hyperparameters)
-    
     #we will need to check the probability distribution we use here 
     
     #obs_space.shape[0] is input dims
-    self.actor_network = actor_network(self.obs_space.shape[0], self.hidden_size, self.action_space.n) #.n to go from discrete(2) to 2 (can just do actor_network(obs_))
-    self.critic_network = critic_network(self.obs_space.shape[0], self.hidden_size, 1) #maybe double descent this? add a multiplier to overparamterize
+    self.actor_network = actor_network(self.obs_space.shape[0], self.hidden_size, self.output_size).to(device) #.n to go from discrete(2) to 2 (can just do actor_network(obs_))
+    self.critic_network = critic_network(self.obs_space.shape[0], self.hidden_size, 1).to(device) #maybe double descent this? add a multiplier to overparamterize
 
     #AdamW is considered the best optimizer currently for PPO
     self.actor_optimizer = opt.AdamW(self.actor_network.parameters(), lr = self.lr_actor)
@@ -81,8 +86,8 @@ class PPO:
         terminated = False #end of the episode naturally
         with torch.no_grad():
           observations.append(obs)
-          actn, sampled_probs = self.get_action(obs, self.distribution)
-          obs, reward, terminated, truncated, _ = self.env.step(actn) #truncated is ending the episode due to timestep reasons
+          actn, sampled_probs = self.get_action(obs, self.dist_name)
+          obs, reward, terminated, truncated, _ = self.env.step(self.to_env(actn)) #truncated is ending the episode due to timestep reasons
           rewards.append(reward)
           episode_return.append(reward)
           next_observations.append(obs)
@@ -104,14 +109,14 @@ class PPO:
       returns[i] = sum(returns[i])
       
     #convert to tensors (first to np arrays then to tensors for efficiency over straight python lists)
-    actions_tensor = torch.tensor(actions, dtype=torch.long) #(2048,)
-    rewards_tensor = torch.tensor(rewards, dtype=torch.float32).unsqueeze(-1) #(2048,) -> (2048, 1)
-    returns_tensor = torch.tensor(returns, dtype=torch.float32) #(#of episodes,)
-    obs_tensor = torch.tensor(np.array(observations), dtype=torch.float32) #(2048, 4)
-    next_obs_tensor = torch.tensor(np.array(next_observations), dtype=torch.float32) #(2048,4)
+    actions_tensor = torch.stack(actions, dim = 0) #(2048,)
+    rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=device).unsqueeze(-1) #(2048,) -> (2048, 1)
+    returns_tensor = torch.tensor(returns, dtype=torch.float32, device=device) #(#of episodes,)
+    obs_tensor = torch.tensor(np.array(observations), dtype=torch.float32, device=device) #(2048, 4)
+    next_obs_tensor = torch.tensor(np.array(next_observations), dtype=torch.float32, device=device) #(2048,4)
     logprobs_tensor = torch.stack(logprobs, dim=0) #(2048,)
-    dones_tensor = torch.tensor(dones, dtype=torch.bool).unsqueeze(-1) #(2048,) -> (2048,1)
-    end_episode_tensor = torch.tensor(end_episode, dtype = torch.bool).unsqueeze(-1) #(2048,) -> (2048,1)
+    dones_tensor = torch.tensor(dones, dtype=torch.bool, device=device).unsqueeze(-1) #(2048,) -> (2048,1)
+    end_episode_tensor = torch.tensor(end_episode, dtype = torch.bool, device=device).unsqueeze(-1) #(2048,) -> (2048,1)
     
     with torch.no_grad():
       tnsrdct = TensorDict({"obs" : obs_tensor, 
@@ -131,21 +136,20 @@ class PPO:
 
   
   def get_action(self, observation_state, distribution):
+
       logits = self.actor_network(observation_state) #returns a tensor, so probability dist should be able to accept it
-      #theta is the raw logits, need softmax on those
-      theta = torch.softmax(logits, dim = -1)
-      probability_dist = distribution(probs = theta)
-      sampled_action = probability_dist.sample() #this returns an idx of the actual sampled action.
-      #if its categorical, ret idx of selected category. If bernouli, return index of selected action (0 or 1)
-      log_probs = torch.log(theta[sampled_action])
-      return sampled_action.item(), log_probs
+      _ , prob_dist = self.make_dist(self.dist_name, logits)
+      sampled_action = prob_dist.sample() #this returns an idx of the actual sampled action.
+      log_probs = prob_dist.log_prob(sampled_action)
+      return sampled_action, log_probs
     
   def compute_GAE(self, value_network):
     value_dict = TensorDictModule(module = value_network, in_keys=['obs'], out_keys=['state_value'])
     gae = GAE(
       gamma = self.gamma,
       lmbda = self.lam,
-      value_network = value_dict
+      value_network = value_dict,
+      device=device
     )
     return gae
   
@@ -203,21 +207,25 @@ class PPO:
 
       advtg, vf, logprobs_tensor, _, obs_tensor, actions_tensor, _, _, returns_tensor = self.rollout()
       mean_episode_return.append(torch.mean(returns_tensor).item())
+      print(f"Iter return: {mean_episode_return[-1]:.1f}")
       data = TensorDataset(logprobs_tensor, advtg, vf, actions_tensor, obs_tensor) #make the data needed into a tensor dataset
       train_dataloader = DataLoader(data, batch_size=self.minibatch_size, shuffle = True) #make it into a dataloader
       #logprobs_tensor is old (2048,)
-      for _ in range(self.epochs):
+      for idx in range(self.epochs):
+        summed_epoch_loss = 0
+        print(f"Epoch: {idx}")
         for minibatch in train_dataloader:
           #unpack the train_dataloader (logprobs_tensor, advtg, vf, actions_tensor, obs_tensor)
           old_lps, advs, vfs, acts, observes = minibatch #unpack
           self.actor_optimizer.zero_grad()
           self.critic_optimizer.zero_grad()
           output = self.actor_network(observes) #forward pass
-          curr_dist = self.distribution(logits = output) #this is curr dist (logprob of curr)
+          _, curr_dist = self.make_dist(self.dist_name, output) #this is curr dist (logprob of curr)
           curr_lps = curr_dist.log_prob(acts)
           loss = self.objective(old_lps, curr_lps, advs, curr_dist, self.critic_network(observes), vfs)
           with torch.no_grad():
             losses.append(loss.item())
+            summed_epoch_loss += loss.item()
             #Schulman approximate KL divergence: http://joschu.net/blog/kl-approx.html
             #forward KL divergence: KL = E[log(old) - log(curr)] since we are doing KL-divergence of the logprobs
             #let p(x) be the curr, let q(x) be the old. log_ratio = log(p(x)/q(x)) = curr_lps - old_lps 
@@ -227,9 +235,14 @@ class PPO:
             ratio = torch.exp(log_ratio)
             approx_forward_kl_div = torch.mean((ratio-1) - log_ratio) #recalling torch.log(ratio) is back to log_ratio
             approx_KL.append(approx_forward_kl_div.item())
+          
           loss.backward()
           self.actor_optimizer.step()
           self.critic_optimizer.step()
+        #stop early if our KL divergence between the old and new policy is too larget
+        if self.target_kl is not None and approx_forward_kl_div > self.target_kl:
+          break
+        print(f"Avg Loss: {round(summed_epoch_loss/len(train_dataloader),4)}")
       total_timesteps += self.max_rollout_size
       
     return np.array(losses), np.array(mean_episode_return), np.array(approx_KL)
@@ -241,16 +254,8 @@ class PPO:
     self.max_timesteps_per_episode = hyperparameters['episode_cap'] #a cap on the number of steps we can take in one given episode
     self.num_iterations = hyperparameters['num_iterations']
     #it limits how long a SINGLE episode can go
-    self.distribution = hyperparameters['distribution']
-    dists = {
-      "Bernouli": Bernoulli,
-      "Categorical": Categorical,
-      "Normal": Normal,
-      "Multivariate": MultivariateNormal,
-      "Beta": Beta
-    }
-    self.distribution = dists[self.distribution]
-    
+    self.dist_name = hyperparameters['distribution']
+    self.output_size, _ = self.make_dist(self.dist_name)
          
     #GAE & PPO hypers
     self.lam = hyperparameters['lambda'] #at lam=0, it is TD(0), at lam =1, it is pure MC
@@ -264,6 +269,7 @@ class PPO:
     self.c2 = hyperparameters['c2'] #entropy weight
     self.epochs = hyperparameters['epochs'] #how many times the algorithm loops over the entire 4,800-step rollout dataset during a single training phase
     self.minibatch_size = int(self.max_rollout_size/16) #if 4096, then 256 minibatch size, 128 if 2048
+    self.target_kl = hyperparameters['target_kl']
     
     #actor critic NN hypers
     #may get some use in scheduling these (should actually schedule these, decay to 0)
@@ -271,7 +277,39 @@ class PPO:
     self.lr_critic = hyperparameters['learning_rate_critic']
     self.hidden_size = hyperparameters['hidden_size']
     
+    
+  def make_dist(self, dist_name, output_head = None): 
+    dists = {
+      #lambda prevents eager evaluation
+      "Bernoulli": lambda: 1,
+      "Categorical": lambda: self.action_space.n,
+      "Normal": lambda: 2 * self.action_space.shape[0],
+      "Beta": lambda: 2 * self.action_space.shape[0],
+    }
+    size_lam = dists[dist_name]
+
+    if output_head is None:
+      return size_lam(), None
+    
+    match dist_name:
+      case "Categorical": return size_lam(), Categorical(logits = output_head)
+      case "Bernoulli": return size_lam(), Bernoulli(logits = output_head.squeeze(-1))
+      case "Normal": 
+        mu, log_std = output_head.chunk(2, dim=-1)
+        return size_lam(), Independent(Normal(mu, log_std.clamp(-5, 2).exp()), 1)
+      case "Beta":
+          a, b = (F.softplus(output_head) + 1).chunk(2, dim=-1) #a = alpha, b = beta (pseudocounts)
+          return size_lam(), Independent(Beta(a, b), 1)
   
+  def to_env(self, actn):
+    match self.dist_name:
+      case "Categorical" : return int(actn.item())
+      case "Bernoulli": return int(actn.item())
+      case "Normal": return np.clip(actn.cpu().numpy(), self.action_space.low, self.action_space.high) #.cpu() needed since numpy only works on CPU tensors
+      case "Beta":   return self.action_space.low + actn.cpu().numpy() * (self.action_space.high - self.action_space.low)
+
+
+    
   
 '''
 
