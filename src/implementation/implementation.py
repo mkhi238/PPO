@@ -107,8 +107,7 @@ class PPO:
       if "episode" in info:
         returns.append(info["episode"]["r"])
       else: 
-        for i in episode_return:
-          returns.append(sum(episode_return))
+        returns.append(sum(episode_return))
           
       dones[-1] = True #since our episode is done
       
@@ -246,9 +245,13 @@ class PPO:
             approx_KL.append(approx_forward_kl_div.item())
           
           loss.backward()
+          #CleanRL uses this trick (regular gradient clipping) to further prevent destructive updates in the actor and critic
+          nn.utils.clip_grad_norm_(self.actor_network.parameters(), 0.5)
+          nn.utils.clip_grad_norm_(self.critic_network.parameters(), 0.5)
           self.actor_optimizer.step()
           self.critic_optimizer.step()
-        #stop early if our KL divergence between the old and new policy is too larget
+
+        #stop early if our KL divergence between the old and new policy is too larget (here to prevent overall destructive epochs)
         if self.target_kl is not None and approx_forward_kl_div > self.target_kl:
           break
         print(f"Avg Loss: {round(summed_epoch_loss/len(train_dataloader),4)}")

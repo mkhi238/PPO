@@ -31,7 +31,7 @@ if __name__ == '__main__':
   params = {
     'horizon' : 2048,
     'episode_cap' : 1000,
-    'num_iterations': 2500,
+    'num_iterations': 5000,
     'distribution': "Categorical",
     'lambda' : 0.95,
     'gamma' : 0.99, #for LunarLander gamma = 0.999 since its a long run reward task (value future outcomes more)
@@ -61,11 +61,11 @@ if __name__ == '__main__':
   
   PPO_breakout = init_agent(env, FeedForwardNetwork, FeedForwardNetwork, **params)
   losses, mean_episode_rets, approx_KL = PPO_breakout.train_model()
-  np.savez("breakout_run.npz", losses=losses, returns=mean_episode_rets, kl=approx_KL)
+  np.savez("breakout_run_5000_iters.npz", losses=losses, returns=mean_episode_rets, kl=approx_KL)
   
   #Mujoco needs to save mean and variance (theta_miu, theta_sigma)
   # theta = env.get_wrapper_attr("obs_rms")
   # np.savez("breakout_obs_rms.npz", mean=theta.mean, var=theta.var)
   
   print("training completed")
-  torch.save(PPO_breakout.actor_network.state_dict(), "breakout_actor.pt")
+  torch.save(PPO_breakout.actor_network.state_dict(), "breakout_actor_5000_iters.pt")
