@@ -87,7 +87,7 @@ class PPO:
         with torch.no_grad():
           observations.append(obs)
           actn, sampled_probs = self.get_action(obs, self.dist_name)
-          obs, reward, terminated, truncated, _ = self.env.step(self.to_env(actn)) #truncated is ending the episode due to timestep reasons
+          obs, reward, terminated, truncated, info = self.env.step(self.to_env(actn)) #truncated is ending the episode due to timestep reasons
           rewards.append(reward)
           episode_return.append(reward)
           next_observations.append(obs)
@@ -99,14 +99,21 @@ class PPO:
           episode_len += 1
           if truncated or terminated:
             break
-      returns.append(episode_return)
+          
+      #append the unnormalized rewards to compare against CleanRL benchmarks
+      #we are literally only tracking this as another metric to use to see our success other than loss
+      #simply summing up the rewards of the episode (so the return of a set of actions, the total accumulated reward)
+      #recall return = sigma(reward)_T (summed reward over all timesteps)
+      if "episode" in info:
+        returns.append(info["episode"]["r"])
+      else: 
+        for i in episode_return:
+          returns.append(sum(episode_return))
+          
       dones[-1] = True #since our episode is done
       
     if not (terminated or truncated) and episode_len < self.max_timesteps_per_episode:
       returns.pop()
-
-    for i in range(len(returns)):
-      returns[i] = sum(returns[i])
       
     #convert to tensors (first to np arrays then to tensors for efficiency over straight python lists)
     actions_tensor = torch.stack(actions, dim = 0) #(2048,)
@@ -135,11 +142,13 @@ class PPO:
     return advtg, vf, logprobs_tensor, rewards_tensor, obs_tensor, actions_tensor, dones_tensor, end_episode_tensor, returns_tensor #need to return these so that when we do loss.backwards() it works
 
   
-  def get_action(self, observation_state, distribution):
+  def get_action(self, observation_state, distribution, beta_clip = 0.01):
 
       logits = self.actor_network(observation_state) #returns a tensor, so probability dist should be able to accept it
       _ , prob_dist = self.make_dist(self.dist_name, logits)
       sampled_action = prob_dist.sample() #this returns an idx of the actual sampled action.
+      if self.dist_name == "Beta":
+        sampled_action = sampled_action.clip(beta_clip, 1-beta_clip)
       log_probs = prob_dist.log_prob(sampled_action)
       return sampled_action, log_probs
     
@@ -245,6 +254,7 @@ class PPO:
         print(f"Avg Loss: {round(summed_epoch_loss/len(train_dataloader),4)}")
       total_timesteps += self.max_rollout_size
       
+    #return as arrays so i can save and graph them
     return np.array(losses), np.array(mean_episode_return), np.array(approx_KL)
   
   def _init_hyperparameters(self, **hyperparameters):
